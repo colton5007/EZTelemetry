@@ -6,6 +6,7 @@ import os, time
 import serial
 import threading
 import logging
+import copy
 
 channels = list()
 types = list()
@@ -15,24 +16,26 @@ death_topic = f"EZTelemetry/{org}/{group}/death"
 command_topic = f"EZTelemetry/{org}/{group}/{device_id}/command"
 data_topic = f"EZTelemetry/{org}/{group}/{device_id}/data"
 
+payload_base = None
+ser = None
+
 
 def load_channels():
 	file = open("channels").readlines()
 	for line in file:
-		split = line.replace('\n', '').replace(' ', '_').split(',')
-		channels.append(split[0])
-		types.append(split[1])
+		split = line.replace('\n', '').split(',')
+		channels.append(split[0].replace(' ', '_'))
+		types.append(split[1].replace(' ', ''))
 
 
-def on_connect(client, userdata, flags, rc):
+def on_connect(client2, userdata, flags, rc):
 	logging.info("Connected with result code " + str(rc))
-	print("Connected with result code " + str(rc))
 	client.subscribe(birth_topic)
 	client.subscribe(command_topic)
 	client.subscribe(data_topic)
 
 
-def on_message(client, userdata, msg):
+def on_message(client2, userdata, msg):
 	topic = msg.topic
 	if topic == command_topic:
 		command = json.loads(msg.payload)
@@ -56,18 +59,18 @@ def publish_birth():
 
 		}
 	}
-	payload_base = payload.copy()
+	payload_base = copy.deepcopy(payload)
 	for i in range(len(channels)):
-		payload = add_data(payload, channels[i], types[i])
-	total_byte_array = bytearray(json.dumps(payload), encoding="UTF-8")
+		payload['data'][channels[i]] = types[i]
+	total_byte_array = json.dumps(payload)
 	client.publish(birth_topic, total_byte_array, 0, False)
+	print(f"Sent birth packet {total_byte_array}")
 
 
 def send_data(msg):
 	try:
 		dt = str(datetime.datetime.utcnow().isoformat())+'Z'
-		byte_array = bytearray(msg, encoding="UTF-8")
-		client.publish(data_topic, byte_array, 0, False)
+		client.publish(data_topic, msg, 0, False)
 		logging.info(" [i] Data sent to the cloud \n")
 	except Exception as e:
 		print(e)
@@ -88,7 +91,7 @@ def upload_cache():
 						ts = str(line.split(' ', 1)[0])
 						line = line.split(' ', 1)[1]
 						dt = str(datetime.datetime.utcnow().isoformat())
-						byte_array = bytearray(line, encoding="UTF-8")
+						byte_array = bytes(line, encoding="UTF-8")
 						client.publish(data_topic, byte_array, 0, False)
 						logging.info(" [i] Cached data sent !")
 						os.system("sed -i '/" + ts + "/d' " + cache_file)
@@ -101,23 +104,25 @@ def upload_cache():
 
 def get_data():
 	global ser
+	publish_birth()
 	while True:
+		client.loop()
 		try:
 			# Get timestamp
-			global serial_payload
 			dt = str(datetime.datetime.utcnow().isoformat())+'Z'
-			if IP_enabled:
-				ser = serial.serial_for_url("socket://" + str(IP) + ":" + str(Port) + "/logging=debug",
-											timeout=int(IP_timeout))
-			elif Serial_enabled:
-				ser = serial.Serial(
-					port=Address,
-					baudrate=Baud,
-					parity=serial.PARITY_NONE,
-					stopbits=serial.STOPBITS_ONE,
-					bytesize=serial.EIGHTBITS,
-					timeout=Serial_timeout,
-					write_timeout=10)
+			if not ser:
+				if IP_enabled:
+					ser = serial.serial_for_url("socket://" + str(IP) + ":" + str(Port) + "/logging=debug",
+												timeout=int(IP_timeout))
+				elif Serial_enabled:
+					ser = serial.Serial(
+						port=Address,
+						baudrate=Baud,
+						parity=serial.PARITY_NONE,
+						stopbits=serial.STOPBITS_ONE,
+						bytesize=serial.EIGHTBITS,
+						timeout=Serial_timeout,
+						write_timeout=10)
 			data = ser.readline()
 			logging.info("\n Data received")
 			logging.info(data)
@@ -133,34 +138,34 @@ def get_data():
 				data_prep = re.split(r'[,|;"\t]+', encode)
 				data_prep = [item.strip() for item in data_prep if item]
 
-				payload = payload_base.copy()
+				serial_payload = copy.deepcopy(payload_base)
 				for i in range(len(data_prep)):
 					if types[i] == 'String':
-						payload = add_data(serial_payload, channels[i], data_prep[i])
+						serial_payload['data'][channels[i]] = data_prep[i]
 					elif types[i] == 'Double':
-						payload = add_data(serial_payload, channels[i], float(data_prep[i]))
+						serial_payload['data'][channels[i]] = float(data_prep[i])
 
-				msg = json.dumps(payload)
+				msg = json.dumps(serial_payload)
 				logging.info(msg + "\n")
 				if len(data_prep) == len(channels):
 					send_thread = threading.Thread(target=send_data(msg), args=(msg,))
 					send_thread.start()
 				else:
-					print('Wrong data stream format - have ' + str(len(data_prep)) + ' channels')
-					logging.info('Wrong data stream format')
+					logging.info('Wrong data stream format - have ' + str(len(data_prep)) + ' channels')
 			else:
 				logging.info(" [!] Empty data received !")
-				print("\n" + dt + " [!] Empty data received !")
 		except serial.SerialException as e:
 			logging.info(e)
+			ser = None
 			logging.info(" [!] No data was received .. Retrying in 10 seconds")
 			time.sleep(10)
 
 
 load_channels()
+logging.info(channels)
 
 # MQTT initialization
-client = mqtt.Client(server_url, server_port, 60)
+client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
 
@@ -168,6 +173,4 @@ death_byte_array = bytearray(json.dumps(payload_base), encoding="UTF-8")
 client.will_set(death_topic, death_byte_array, 0, False)
 client.connect(server_url, server_port, 60)
 time.sleep(.1)
-client.loop()
-publish_birth()
 get_data()
